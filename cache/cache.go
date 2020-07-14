@@ -1,6 +1,9 @@
 package cache
 
 import (
+	"encoding/gob"
+	"fmt"
+	"io"
 	"sync"
 	"time"
 )
@@ -35,10 +38,11 @@ type Cache struct {
 	itemsMap      map[string]Item
 	mutex         sync.RWMutex
 	onEviction    OnEvictionFunc
+	// expiryJanitor
 }
 
-// Set ...
-func (cache *Cache) Set(k string, v interface{}, expiryDuration time.Duration) {
+// Put ...
+func (cache *Cache) Put(k string, v interface{}, expiryDuration time.Duration) {
 	var expiry int64
 
 	if expiryDuration == DefaultExpiryDuration {
@@ -87,4 +91,72 @@ func (cache *Cache) Delete(k string) {
 	cache.mutex.Unlock()
 }
 
+// OnEvicted sets an (optional) function that will be called with the key, value input
+// when a delete operation is called and item is evicted successfully from the cache.
+// However, OnEvicted() will not be call for overriding values with same key.
+// Set to nil to disable, otherwise pass a function for on-evicted callback.
+func (cache *Cache) OnEvicted(f OnEvictionFunc) {
+	cache.mutex.Lock()
+	cache.onEviction = f
+	cache.mutex.Unlock()
+}
 
+// Len gives the number of items in the cache
+// similar to len([]items)
+func (cache *Cache) Len() int {
+	cache.mutex.RLock()
+	defer cache.mutex.RUnlock()
+	return len(cache.itemsMap)
+}
+
+// Save ...
+func (cache *Cache) Save(w io.Writer) (err error) {
+	encoder := gob.NewEncoder(w)
+	defer func() {
+		if x := recover(); x != nil {
+			err = fmt.Errorf("error cache.Save() registering item types to disk")
+		}
+	}()
+	cache.mutex.Lock()
+
+	// TODO: if item types are predefined, e.g. string or int only
+	// then this could hurt performance quite a bit
+	for _, v := range cache.itemsMap {
+		if !v.Expired() {
+			gob.Register(v.Object)
+		}
+	}
+	err = encoder.Encode(&cache.itemsMap)
+	return
+}
+
+// Load ...
+func (cache *Cache) Load(r io.Reader) error {
+	decoder := gob.NewDecoder(r)
+	items := make(map[string]Item)
+
+	err := decoder.Decode(&items)
+	if err != nil {
+		return err
+	}
+
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+
+	for k, v := range items {
+		object, exist := cache.itemsMap[k]
+		if !exist || object.Expired() {
+			cache.itemsMap[k] = v
+		}
+	}
+
+	return nil
+}
+
+// Flush delete all items from the cache regardless
+// expiration deadline. It startover a with a new empty cache.
+func (cache *Cache) Flush() {
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+	cache.itemsMap = make(map[string]Item)
+}
