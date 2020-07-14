@@ -9,10 +9,8 @@ import (
 )
 
 const (
-	// NoExpiryDuration ...
-	NoExpiryDuration time.Duration = -1
-	// DefaultExpiryDuration ...
-	DefaultExpiryDuration time.Duration = 0
+	// NoExpiry ...
+	NoExpiry time.Duration = -1
 )
 
 // OnEvictionFunc ...
@@ -26,7 +24,7 @@ type Item struct {
 
 // Expired ...
 func (item Item) Expired() bool {
-	if item.ExpiryNano == 0 {
+	if item.ExpiryNano == 0 { // no expiry
 		return false
 	}
 	return time.Now().UnixNano() > item.ExpiryNano
@@ -42,13 +40,31 @@ type Cache struct {
 }
 
 // Put ...
-func (cache *Cache) Put(k string, v interface{}, expiryDuration time.Duration) {
+func (cache *Cache) Put(k string, v interface{}) {
 	var expiry int64
 
-	if expiryDuration == DefaultExpiryDuration {
-		expiryDuration = cache.defaultExpiry
+	// Using default expiry if cache.defaultExpiry is set > 0
+	// otherwise item will never be expired
+	if cache.defaultExpiry > 0 {
+		expiry = time.Now().Add(cache.defaultExpiry).UnixNano()
 	}
 
+	item := Item{
+		Object: v, ExpiryNano: expiry,
+	}
+
+	cache.mutex.Lock()
+	cache.itemsMap[k] = item
+
+	cache.mutex.Unlock()
+}
+
+// PutExpiry ...
+func (cache *Cache) PutExpiry(k string, v interface{}, expiryDuration time.Duration) {
+	var expiry int64
+
+	// Set expiryDuration to -1 for no expiry time
+	// Set expiryDuration as positive int (sec) for setting expiry time
 	if expiryDuration > 0 {
 		expiry = time.Now().Add(expiryDuration).UnixNano()
 	}
@@ -72,23 +88,30 @@ func (cache *Cache) Get(k string) (interface{}, bool) {
 	// expired already
 	if !found || item.Expired() {
 		cache.mutex.RUnlock()
-		return nil, found
+		return nil, false
 	}
 
 	cache.mutex.RUnlock()
-	return item, found
+	return item.Object, true
 }
 
 // Delete ...
-func (cache *Cache) Delete(k string) {
+func (cache *Cache) Delete(k string) bool {
 	cache.mutex.Lock()
-	if item, found := cache.itemsMap[k]; found {
+	item, found := cache.itemsMap[k]
+	if found {
 		delete(cache.itemsMap, k)
 		if cache.onEviction != nil {
 			cache.onEviction(k, item)
 		}
 	}
 	cache.mutex.Unlock()
+	return found
+}
+
+type keyvaluePair struct {
+	Key   string
+	Value interface{}
 }
 
 // OnEvicted sets an (optional) function that will be called with the key, value input
@@ -144,8 +167,10 @@ func (cache *Cache) Load(r io.Reader) error {
 	defer cache.mutex.Unlock()
 
 	for k, v := range items {
-		object, exist := cache.itemsMap[k]
-		if !exist || object.Expired() {
+		_, exist := cache.itemsMap[k]
+		if !exist {
+			// We don't ignore expired items here
+			// to respect no cleanup option.
 			cache.itemsMap[k] = v
 		}
 	}
@@ -159,4 +184,33 @@ func (cache *Cache) Flush() {
 	cache.mutex.Lock()
 	defer cache.mutex.Unlock()
 	cache.itemsMap = make(map[string]Item)
+}
+
+// New returns a new cache with a given default expiry duration and cleanup
+// interval. If itemExpiry duration is less than 1 (e.g. -1) it will never
+// expire.
+//
+// The cache will also have a clean-up mechanism that polls on fixed interval
+// and run cache cleanup to find and delete expired items.
+// If the cleanup interval is less than one, expired items are not deleted
+// from cache before calling cache.DeleteExpired().
+func New(defaultExpiry, saveInterval, cleanupInterval time.Duration) *Cache {
+	itemsMap := make(map[string]Item)
+	cache := &Cache{
+		defaultExpiry: defaultExpiry,
+		itemsMap:      itemsMap,
+		mutex:         sync.RWMutex{},
+	}
+	return cache
+}
+
+// NewFrom loads the previously saved cache and returns a cache that uses
+// previously saved key-value data.
+func NewFrom(defaultExpiry, cleanupInterval time.Duration, itemsMap map[string]Item) *Cache {
+	cache := &Cache{
+		defaultExpiry: defaultExpiry,
+		itemsMap:      itemsMap,
+		mutex:         sync.RWMutex{},
+	}
+	return cache
 }
